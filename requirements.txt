@@ -9,7 +9,9 @@ idna==2.6
 itsdangerous==0.24
 Jinja2==2.9.6
 MarkupSafe==1.0
+redis==2.10.6
 requests==2.18.4
+rethinkdb==2.3.0.post6
 six==1.11.0
 urllib3==1.22
 webencodings==0.5.1
