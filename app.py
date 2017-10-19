@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging
 import os
 import json
@@ -9,13 +10,15 @@ import redis
 import rethinkdb as r
 from rethinkdb.errors import RqlRuntimeError, RqlDriverError
 
+from fb_api import send_quick_reply, send_text_msg
+
 app = Flask(__name__)
 gunicorn_error_logger = logging.getLogger('gunicorn.error')
 app.logger.handlers.extend(gunicorn_error_logger.handlers)
 app.logger.setLevel(logging.DEBUG)
+bus_ids = json.load(open('./utils/bus_ids.json'))
 
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN')
-PAGE_ACCESS_TOKEN = os.getenv('PAGE_ACCESS_TOKEN')
 REDIS_HOST = os.getenv('REDIS_HOST')
 REDIS_PORT = os.getenv('REDIS_PORT')
 REDIS_NO = os.getenv('REDIS_NO')
@@ -30,7 +33,9 @@ def init_redis():
     db = redis.StrictRedis(
         host=REDIS_HOST,
         port=REDIS_PORT,
-        db=REDIS_NO)
+        db=REDIS_NO,
+        charset="utf-8",
+        decode_responses=True)
     return db
 
 @app.before_request
@@ -71,52 +76,6 @@ def get_time_by_route(route_name):
         data[k] = d
     return data
 
-def send_msg(data):
-    res = requests.post("https://graph.facebook.com/v2.6/me/messages",
-                        params={'access_token': PAGE_ACCESS_TOKEN},
-                        json=data)
-    if res.status_code == 200:
-        app.logger.info("Successfully send msg id %s to user %s"%(res.json().get('message_id'), res.json().get('recipient_id')))
-    else:
-        app.logger.info(res.text)
-
-def send_text_msg(recipient_id, message_text):
-    chunk_size = 640
-    r = ''
-    dd = []
-    for row in message_text.split('\n'):
-        if len(r+row+'\n') > chunk_size:
-            dd.append(r)
-            r = ''
-        r = r+row+'\n'
-    dd.append(r)
-    for chunk in dd:
-        data = {
-            "recipient": {"id": recipient_id},
-            "message": {"text": chunk}
-        }
-        send_msg(data)
-def send_quick_reply(recipient_id, message_text):
-    data = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": message_text,"quick_replies":[
-      {
-        "content_type":"text",
-        "title":"Search",
-        "payload":"<POSTBACK_PAYLOAD>",
-        "image_url":"http://example.com/img/red.png"
-      },
-      {
-        "content_type":"location"
-      },
-      {
-        "content_type":"text",
-        "title":"Something Else",
-        "payload":"<POSTBACK_PAYLOAD>"
-      }
-    ]}
-    }
-    send_msg(data)
 
 def render_res(data):
     res = ""
@@ -142,18 +101,55 @@ def webhook():
                 time_of_event = entry.get('time')
 
                 for event in entry.get('messaging'):
+
+                    """
+                    Message
+                    """
                     if event.get('message'):
                         app.logger.debug(event)
-                        msg = event.get('message').get('text')
-                        data = get_time_by_route(msg)
-                        if data:
-                            for k in data:
-                                res = render_res(data[k])
-                                send_text_msg(event.get('sender').get('id'), res)
-                            send_quick_reply(event.get('sender').get('id'), "請選擇想要推播的站牌id")
-                        else:
-                            send_text_msg(event.get('sender').get('id'), ERROR_MSG)
-                          
+                        user_id = event.get('sender').get('id')
+                        
+                        # Get context from Redis
+                        context = g.redis.hgetall(user_id) or {"state":"begin"}
+                        history = g.redis.zrange('%s_history'%user_id, -6, -1)
+                        if context:
+                            app.logger.debug('User context found, %s'%context)
+                        msg = event.get('message').get('text') or evnt.get('message').get('quick_reply').get('payload')
+
+                        if msg == '再次查詢':
+                            msg = history[-1]
+
+                        if msg == '取消':
+                            context['state'] = 'begin'
+                            g.redis.hmset(user_id, context)
+                            g.redis.expire(user_id, 60)
+                            send_text_msg(user_id, "請重新輸入")
+                            return ''
+
+                        #send_quick_reply(user_id, "請選擇想要推播的站牌id")
+
+                        if context.get('state') == 'begin':
+                            
+                            """
+                            Check if bus_id is valid
+                            """
+                            if msg not in bus_ids:
+                                send_text_msg(user_id, ERROR_MSG)
+                                return ''
+                                
+                            data = get_time_by_route(msg)
+                            if data:
+                                for k in data:
+                                    res = render_res(data[k])
+                                    send_text_msg(user_id, res)
+                                send_quick_reply(user_id, "請選擇下列快速功能，或輸入其他公車路線")
+                                context['bus_no'] = msg
+                                g.redis.zadd('%s_history'%user_id, datetime.now().timestamp(), msg)
+                                g.redis.zremrangebyrank('%s_history'%user_id, 0, -6)
+                                g.redis.hmset(user_id, context)
+                                g.redis.expire(user_id, 60)
+                            else:
+                                send_text_msg(user_id, "查詢系統出現錯誤，請稍後再試")
                     else:
                         app.logger.debug('Webhook received unknow event: %s'%event)
         return 'ok'
